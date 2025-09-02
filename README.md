@@ -4,9 +4,15 @@ This repo provides the framework and training tools required to create your own 
 
 ## Features (v1 Target)
 -Local LLM support (Originally built around Phi-3)
+
 -JSONL-based training workflow for LoRA finetunes
+
 -Modular memory tiers (short, mid, long-term) [Stored Locally]
+
 -Sprite-driven GUI (plug-and-play art packs)
+
 -Offline STT/TTS pipelines
+
 -Configurable persona [via training & sprite packs]
+
 -Extendable via plugins and mode scripting
