@@ -1,18 +1,35 @@
 # AIDE – Offline Assistant Framework
-AIDE is a modular framework for building personalized, fully offline AI assistants. It integrates local LLMs, memory tiers, TTS/STT pipelines, and a sprite-driven GUI into a single customizable package.
-This repo provides the framework and training tools required to create your own assistant. For quicker deployment or testing, you can use the generic Phi-3 model: microsoft/Phi-3-mini-4k-instruct
+AIDE is a modular framework for building personalized, fully offline AI assistants.
+It’s designed for both embedded and desktop environments (such as the Raspberry Pi 5) and emphasizes modularity, local processing, and personality-driven interaction.
+
+## Status:
+The LoRA fine-tuning framework for customizing Phi-3 models has been tested with sucess when used with strong system prompting and elevated model temperatues (starting at: `--temp 0.7`)
+Once stable and repeatable results are achieved, backend deployment code for use on the Raspberry Pi 5 will be added to this repository.
 
 ## Features (v1 Target)
--Local LLM support (Originally built around Phi-3)
+- Local LLM Support — Originally built around Phi-3
 
--JSONL-based training workflow for LoRA finetunes
+- JSONL-Based Training — LoRA fine-tuning for custom personalities
 
--Modular memory tiers (short, mid, long-term) [Stored Locally]
+- Modular Memory Tiers — Short, mid, and long-term context layers stored locally 
 
--Sprite-driven GUI (plug-and-play art packs)
+- Customizable GUI — Ability to add / modify sprites
 
--Offline STT/TTS pipelines
+- Offline STT/TTS Pipelines — Full voice input and synthesis without internet dependency
 
--Configurable persona [via training & sprite packs]
+- Configurable Persona System — Personality customization via finetuning
 
--Extendable via plugins and mode scripting
+- Extendable Architecture — Plugin and mode scripting support for advanced behaviors
+
+## Planned B.O.M
+- Raspberry Pi 5 16GB
+  
+- Raspberry Pi SSD Hat w/ 512GB NVMe SSD
+  
+- Waveshare 3.5" Touch Screen
+  
+- Adafruit Mini USB Microphone (PID:3367)
+  
+- Adafruit I2S 3W Class D Amplifier Breakout - MAX98357A
+  
+- Uxcell 1.5W 8Ω Mini Speaker
