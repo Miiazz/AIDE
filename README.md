@@ -1,4 +1,8 @@
 # AIDE – Offline Assistant Framework
+![Python](https://img.shields.io/badge/Made%20with-Python-blue)
+![Raspberry Pi](https://img.shields.io/badge/Hardware-Raspberry%20Pi%205-red)
+![Offline AI](https://img.shields.io/badge/Offline_LLM-green)
+
 AIDE is a modular framework for building personalized, fully offline AI assistants.
 It’s designed for both embedded and desktop environments (such as the Raspberry Pi 5) and emphasizes modularity, local processing, and personality-driven interaction.
 
