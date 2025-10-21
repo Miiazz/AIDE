@@ -1,4 +1,6 @@
 import torch, datasets, transformers, peft, os, json
+from copy import deepcopy
+from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model, TaskType
@@ -12,6 +14,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
 DATASET_PATH = "<Your Dataset>"           # Input your JSONL dataset here
 OUTPUT_DIR = "./lora_output"
+MAX_SEQ_LENGTH = 2048
 
 torch.manual_seed(42)
 
@@ -68,101 +71,96 @@ print(f"Total samples loaded: {len(all_samples)}")
 # Convert to dataset
 dataset = Dataset.from_list(all_samples)
 
-# === Proper Phi-3 chat template tokenization with precise masking
-def apply_template(example):
-    messages = example["messages"]
-    
-    # Apply the full chat template to get proper conversation structure
-    full_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        return_tensors=None
-    )
-    
-    # Tokenize the complete conversation
-    model_inputs = tokenizer(
-        full_text,
-        truncation=True,
-        max_length=2048,
-        padding=False
-    )
-    
-    input_ids = model_inputs["input_ids"]
-    labels = [-100] * len(input_ids)  # Start with everything masked
-    
-    # Now we need to find and unmask only the assistant response content
-    # We'll do this by finding the assistant responses in the original text
-    # and mapping them to token positions
-    
-    for i, message in enumerate(messages):
-        if message["role"] == "assistant":
-            # Create conversation up to (but not including) this assistant message
-            context_messages = messages[:i+1]  # Include the assistant message
-            context_without_assistant = messages[:i]  # Exclude the assistant message
-            
-            # Get text up to the assistant response
-            if context_without_assistant:
-                prefix_text = tokenizer.apply_chat_template(
-                    context_without_assistant,
-                    tokenize=False,
-                    return_tensors=None
-                )
-                # Add the assistant marker
-                prefix_text += "<|assistant|>"
-            else:
-                # First message is assistant (unusual but handle it)
-                prefix_text = "<|assistant|>"
-            
-            # Get the full context including assistant response
-            full_context_text = tokenizer.apply_chat_template(
-                context_messages,
+def ensure_eos(text: str) -> str:
+    if text.endswith(tokenizer.eos_token):
+        return text
+    return text + tokenizer.eos_token
+
+
+def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[Dict[str, Any]]:
+    """Trim older turns until prompt+response fits the context window."""
+    trimmed = deepcopy(messages)
+
+    if not trimmed:
+        return trimmed
+
+    response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+    # Account for the EOS token that will be appended via text_target
+    response_length = len(response_ids) + 1
+
+    while trimmed:
+        prompt_ids = tokenizer.apply_chat_template(
+            trimmed,
+            tokenize=True,
+            add_generation_prompt=True
+        )["input_ids"]
+
+        if len(prompt_ids) + response_length <= MAX_SEQ_LENGTH:
+            return trimmed
+
+        # Drop the oldest non-system message
+        drop_idx = None
+        for idx, message in enumerate(trimmed):
+            if message["role"] != "system":
+                drop_idx = idx
+                break
+
+        if drop_idx is None:
+            # Only system messages remain; drop the first one
+            trimmed = trimmed[1:]
+        else:
+            trimmed = trimmed[drop_idx + 1 :]
+
+    return trimmed
+
+
+def conversation_to_examples(messages: List[Dict[str, Any]]):
+    context: List[Dict[str, Any]] = []
+    examples = []
+
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            prompt_messages = trim_prompt_messages(context, message.get("content", ""))
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_messages,
                 tokenize=False,
-                return_tensors=None
+                add_generation_prompt=True
             )
-            
-            # Tokenize both to find the boundaries
-            prefix_tokens = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
-            full_context_tokens = tokenizer(full_context_text, add_special_tokens=False)["input_ids"]
-            
-            # The assistant response is between the context prefix and full context
-            # INCLUDE special tokens in training for complete generation capability
-            
-            # Find the start of the assistant response (after the prefix without assistant)
-            if context_without_assistant:
-                true_prefix_text = tokenizer.apply_chat_template(
-                    context_without_assistant,
-                    tokenize=False,
-                    return_tensors=None
-                )
-                true_prefix_tokens = tokenizer(true_prefix_text, add_special_tokens=False)["input_ids"]
-                start_idx = len(true_prefix_tokens)
-            else:
-                start_idx = 0  # Assistant is first message
-            
-            # End at the full context (includes <|end|> token)
-            end_idx = len(full_context_tokens)
-            
-            # Ensure we don't go beyond the actual input_ids length
-            start_idx = min(start_idx, len(input_ids))
-            end_idx = min(end_idx, len(input_ids))
-            
-            # Unmask the complete assistant response INCLUDING special tokens
-            # This teaches both Aide's personality AND proper response format
-            for j in range(start_idx, end_idx):
-                labels[j] = input_ids[j]
-    
-    return {
-        "input_ids": input_ids,
-        "attention_mask": model_inputs["attention_mask"],
-        "labels": labels
-    }
+
+            response_text = ensure_eos(message.get("content", ""))
+
+            tokenized = tokenizer(
+                prompt_text,
+                text_target=response_text,
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+                padding=False
+            )
+
+            if any(label != -100 for label in tokenized["labels"]):
+                examples.append({
+                    "input_ids": tokenized["input_ids"],
+                    "attention_mask": tokenized["attention_mask"],
+                    "labels": tokenized["labels"]
+                })
+
+        context.append(message)
+
+    return examples
+
+
+processed_examples = []
+for sample in dataset:
+    processed_examples.extend(conversation_to_examples(sample["messages"]))
+
+processed_dataset = Dataset.from_list(processed_examples)
 
 # Create Train / Test split
-split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
+split_dataset = processed_dataset.train_test_split(test_size=0.1, seed=42)
 
-# Tokenize both splits
-train_ds = split_dataset["train"].map(apply_template, remove_columns=split_dataset["train"].column_names)
-val_ds   = split_dataset["test"].map(apply_template, remove_columns=split_dataset["test"].column_names)
+train_ds = split_dataset["train"]
+val_ds = split_dataset["test"]
 
 # === LoRA config
 lora_config = LoraConfig(
@@ -214,7 +212,10 @@ trainer = Trainer(
 )
 
 #===Debug - Test loss with proper training mask
-batch = next(iter(train_ds))
+if len(train_ds) == 0:
+    raise ValueError("No training samples available after preprocessing. Check dataset and filters.")
+
+batch = train_ds[0]
 input_ids = torch.tensor(batch["input_ids"]).unsqueeze(0).to(model.device)
 attention_mask = torch.tensor(batch["attention_mask"]).unsqueeze(0).to(model.device)
 # Use the properly masked labels from our tokenization function
