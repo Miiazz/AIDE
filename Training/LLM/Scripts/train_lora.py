@@ -12,7 +12,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # === Config ===
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
-DATASET_PATH = "<Your Dataset Path"           # Input your JSONL dataset here
+DATASET_PATH = "<Your Dataset Path>"           # Input your JSONL dataset here
 OUTPUT_DIR = "./lora_output"
 MAX_SEQ_LENGTH = 3072  # Increased from 2048 to preserve more personality context
 
