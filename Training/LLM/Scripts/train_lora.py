@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import default_data_collator
 
-# Note: Lines 17 & 398 require user changes for path and system prompt specification. 
+# NOTE: Lines 17 & 78
 
 #=== To improve Efficency (hopefully) - 09/30/25
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -14,8 +14,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # === Config ===
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
-DATASET_PATH = "<Path to your JSONL dataset>"           # Input your JSONL dataset here
-OUTPUT_DIR = "lora_output"
+DATASET_PATH = "<Your Dataset's Path>"           # Input your JSONL dataset here
+OUTPUT_DIR = "./lora_output"
 MAX_SEQ_LENGTH = 3072  # Increased from 2048 to preserve more personality context
 
 torch.manual_seed(42)
@@ -28,8 +28,12 @@ tokenizer.padding_side = "right"
 
 # Phi-3 specific: Use proper chat end token
 END_TOKEN_ID = tokenizer.convert_tokens_to_ids("<|end|>")
+if END_TOKEN_ID is None:
+    raise ValueError("Tokenizer missing <|end|> token; check model/tokenizer pairing.")
+    
 # Check for optimal attention implementation
 attn_impl = "flash_attention_2" if os.environ.get("FLASH2","0")=="1" else "sdpa"
+print(f"Using attention backend: {attn_impl}")
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -41,7 +45,8 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.return_dict = True
 model.config.use_cache = False
 
-# === Load dataset with error handling & strict JSONL parsing
+# === Load dataset with error handling
+# === Load dataset with strict JSONL parsing
 def load_jsonl_robust(file_path):
     """Load JSONL with strict line-by-line parsing"""
     samples = []
@@ -69,6 +74,16 @@ except Exception as e:
 
 print(f"Total samples loaded: {len(all_samples)}")
 
+# Default system prompt for conversations missing one
+DEFAULT_SYSTEM = "You are Aide <Your System Prompt Here>"     # Starts with you are Aide as model Identity should be stated in sys. prompt 
+
+def ensure_system(messages):
+    """Ensure every conversation has a system message for persona anchoring"""
+    if not messages or messages[0].get("role") != "system":
+        print(f"  Warning: Injecting default system prompt for conversation missing one")
+        return [{"role": "system", "content": DEFAULT_SYSTEM}] + messages
+    return messages
+
 # Convert to dataset
 dataset = Dataset.from_list(all_samples)
 
@@ -86,9 +101,9 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
     if not trimmed:
         return trimmed
 
-    response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
-    # Account for the EOS token that will be appended via text_target
-    response_length = len(response_ids) + 1
+    resp = ensure_end(response)  # Use same helper for consistency
+    response_ids = tokenizer(resp, add_special_tokens=False)["input_ids"]
+    response_length = len(response_ids)  # No +1 since ensure_end handles the token
 
     while trimmed:
         prompt_ids = tokenizer.apply_chat_template(
@@ -109,7 +124,7 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
 
         if drop_idx is None:
             # Only system messages remain; NEVER drop system messages
-            # If we can't fit even with system only, break the loop
+            # If it still doesn't fit with system only, break the loop
             break
         else:
             trimmed = trimmed[drop_idx + 1 :]
@@ -191,10 +206,20 @@ def pack_examples(examples, max_len=MAX_SEQ_LENGTH, pad_id=tokenizer.pad_token_i
     for ex in examples:
         need = len(ex["input_ids"])
         have = len(cur["input_ids"])
-        if have and have + need > max_len:
+        
+        # Add separator if we're appending to an existing packed example
+        sep_cost = 1 if have > 0 else 0
+        
+        if have and have + sep_cost + need > max_len:
             flush()
         if need > max_len:
             continue  # Skip overly long examples
+        
+        # Add separator between examples if needed
+        if have > 0:
+            cur["input_ids"].append(END_TOKEN_ID)
+            cur["attention_mask"].append(1)
+            cur["labels"].append(-100)
         
         # Append to current packed example
         cur["input_ids"].extend(ex["input_ids"])
@@ -203,23 +228,16 @@ def pack_examples(examples, max_len=MAX_SEQ_LENGTH, pad_id=tokenizer.pad_token_i
 
     flush()
     
-    # Pad to multiple of 8 for tensor core efficiency
-    def pad_to_mul8(arr, pad_val):
-        rem = (-len(arr)) % 8
-        return arr + [pad_val] * rem if rem else arr
-
-    for p in packed:
-        p["input_ids"] = pad_to_mul8(p["input_ids"], pad_id)
-        p["attention_mask"] = pad_to_mul8(p["attention_mask"], 0)
-        p["labels"] = pad_to_mul8(p["labels"], -100)
-
+    # Let the DataCollator handle padding to multiple of 8
     return packed
 
 # Process all conversations into training examples
 processed_examples = []
 total_conversations = len(dataset)
 for idx, sample in enumerate(dataset):
-    examples = conversation_to_examples(sample["messages"])
+    # Ensure every conversation has a system message
+    messages = ensure_system(sample["messages"])
+    examples = conversation_to_examples(messages)
     processed_examples.extend(examples)
     
     # Log first few examples for validation
@@ -397,7 +415,7 @@ model.eval()
 print("\nSample Generation Test:")
 test_prompt = "Hello! How can I help you today?"
 test_messages = [
-    {"role": "system", "content": "<Your System Prompt>"},
+    {"role": "system", "content": DEFAULT_SYSTEM},
     {"role": "user", "content": test_prompt}
 ]
 
