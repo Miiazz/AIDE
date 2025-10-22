@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import default_data_collator
 
-# NOTE: Lines 17 & 78
+# NOTE: Lines 17, 78 & potentially 266 Require user defined alterations for dataset path, system prompt, and model name. 
 
 #=== To improve Efficency (hopefully) - 09/30/25
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -45,8 +45,7 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.return_dict = True
 model.config.use_cache = False
 
-# === Load dataset with error handling
-# === Load dataset with strict JSONL parsing
+# === Load dataset with error handling & strict JSONL parsing
 def load_jsonl_robust(file_path):
     """Load JSONL with strict line-by-line parsing"""
     samples = []
@@ -264,10 +263,10 @@ for idx, sample in enumerate(dataset):
                 
                 # Check if system prompt is preserved
                 full_prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
-                has_aide_identity = "You are Aide" in full_prompt
+                has_aide_identity = "You are Aide" in full_prompt      # Replace with different  model name if applicable. 
                 
                 print(f"  Example {ex_idx + 1}:")
-                print(f"    System prompt preserved: {'✓' if has_aide_identity else '✗'}")
+                print(f"    System prompt preserved: {'✓' if has_aide_identity else 'X'}")
                 print(f"    Prompt length: {len(prompt_tokens)} tokens")
                 print(f"    Prompt sample: {repr(full_prompt[:100])}...")  # First 100 chars
                 print(f"    Response: {repr(response_text)}")
