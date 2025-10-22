@@ -12,9 +12,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # === Config ===
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
-DATASET_PATH = "<Your JSONL File Path>"           # Input your JSONL dataset here
+DATASET_PATH = "<Your Dataset Path"           # Input your JSONL dataset here
 OUTPUT_DIR = "./lora_output"
-MAX_SEQ_LENGTH = 2048
+MAX_SEQ_LENGTH = 3072  # Increased from 2048 to preserve more personality context
 
 torch.manual_seed(42)
 
@@ -24,10 +24,9 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 model = AutoModelForCausalLM.from_pretrained(
-    
     MODEL_ID,
     torch_dtype=torch.bfloat16,
-    device_map="auto",
+    device_map=None,  # Keep all on single GPU for LoRA training
     trust_remote_code=True,
     attn_implementation="eager"
 )
@@ -106,7 +105,7 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
 
         if drop_idx is None:
             # Only system messages remain; NEVER drop system messages
-            # If we can't fit even with system only, break the loop
+            # If they don't fit even with system only, break the loop
             break
         else:
             trimmed = trimmed[drop_idx + 1 :]
@@ -200,7 +199,7 @@ for idx, sample in enumerate(dataset):
                 prompt_text = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
                 response_text = tokenizer.decode(response_tokens, skip_special_tokens=False)
                 
-                # Check if system prompt is preserved - was getting cut off 
+                # Check if system prompt is preserved
                 full_prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
                 has_aide_identity = "You are Aide" in full_prompt
                 
@@ -236,7 +235,7 @@ if train_lengths:
     print(f"    Average: {sum(train_lengths)/len(train_lengths):.1f}")
     print(f"    Examples at max length ({MAX_SEQ_LENGTH}): {sum(1 for l in train_lengths if l == MAX_SEQ_LENGTH)}")
 
-# === LoRA config - Optimized for Pi5 Q5 performance with intelligence retention
+# === LoRA config - Optimized for Pi5 Q5 performance with intelligence retention (hopefully)
 lora_config = LoraConfig(
     r=48,  # Balanced: enough capacity for personality, not too complex for Q5
     lora_alpha=72,  # Strong adaptation but preserves base intelligence
@@ -267,14 +266,15 @@ training_args = TrainingArguments(
     per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
     num_train_epochs=3,  # Conservative to preserve base intelligence
-    learning_rate=4e-5,  # Moderate LR for personality without overwhelming intelligence
+    learning_rate=6e-5,  # Increased for stronger identity override
     lr_scheduler_type="cosine",  # Cosine for gentler learning curve
-    warmup_ratio=0.15,  # Extended warmup to preserve knowledge
+    warmup_ratio=0.05,  # Reduced warmup for faster identity learning
     bf16=True,             #<- It does not like when this is false
     fp16=False,
     logging_steps=10,
     save_strategy="epoch",
-    eval_strategy="epoch",  # Evaluate each epoch
+    eval_strategy="steps",  # More frequent evaluation for better checkpoint selection
+    eval_steps=50,  # Evaluate every 50 steps
     save_total_limit=3,     # Keep only last 3 checkpoints
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
@@ -285,7 +285,7 @@ training_args = TrainingArguments(
     gradient_checkpointing_kwargs={"use_reentrant": False},   # <--- Added this 9/30/25 to compensate for heftier training on V1 vs lite
     ddp_find_unused_parameters=False,
     remove_unused_columns=False,
-    weight_decay=0.05, # Light regularization to maintain intelligence
+    weight_decay=0.01, # Reduced to avoid washing out LoRA personality signal
 )
 
 # === Trainer
@@ -327,7 +327,7 @@ print(f"  Total training tokens: {total_training_tokens:,}")
 print(f"  Total sequence tokens: {total_sequence_tokens:,}")
 print(f"  Overall training ratio: {total_training_tokens/total_sequence_tokens*100:.1f}%")
 
-# === Train ===
+# === Train
 print(f"\n=== Starting Training ===")
 model.train()
 trainer.train()
@@ -336,10 +336,13 @@ trainer.train()
 print(f"\n=== Post-Training Validation ===")
 model.eval()
 
-# Generate a sample response to validate the model works
+# Generate a sample response to validate the model works with system prompt
 print("\nSample Generation Test:")
 test_prompt = "Hello! How can I help you today?"
-test_messages = [{"role": "user", "content": test_prompt}]
+test_messages = [
+    {"role": "system", "content": "<Your System Prompt>"},
+    {"role": "user", "content": test_prompt}
+]
 
 prompt_text = tokenizer.apply_chat_template(
     test_messages, 
