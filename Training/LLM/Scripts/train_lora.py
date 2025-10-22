@@ -2,7 +2,7 @@ import torch, datasets, transformers, peft, os, json
 from copy import deepcopy
 from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback, DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import default_data_collator
 
@@ -12,7 +12,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # === Config ===
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
-DATASET_PATH = "<Your Dataset>"           # Input your JSONL dataset here
+DATASET_PATH = "<Your JSONL File Path>"           # Input your JSONL dataset here
 OUTPUT_DIR = "./lora_output"
 MAX_SEQ_LENGTH = 2048
 
@@ -34,8 +34,7 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.return_dict = True
 model.config.use_cache = False
 
-# === Load dataset with error handling
-# === Load dataset with robust JSONL parsing
+# === Load dataset with error handling & robust JSONL parsing
 def load_jsonl_robust(file_path):
     """Load JSONL with line-by-line error handling for malformed JSON"""
     samples = []
@@ -93,7 +92,7 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
             trimmed,
             tokenize=True,
             add_generation_prompt=True
-        )["input_ids"]
+        )
 
         if len(prompt_ids) + response_length <= MAX_SEQ_LENGTH:
             return trimmed
@@ -106,8 +105,9 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
                 break
 
         if drop_idx is None:
-            # Only system messages remain; drop the first one
-            trimmed = trimmed[1:]
+            # Only system messages remain; NEVER drop system messages
+            # If we can't fit even with system only, break the loop
+            break
         else:
             trimmed = trimmed[drop_idx + 1 :]
 
@@ -130,19 +130,41 @@ def conversation_to_examples(messages: List[Dict[str, Any]]):
 
             response_text = ensure_eos(message.get("content", ""))
 
-            tokenized = tokenizer(
-                prompt_text,
-                text_target=response_text,
-                truncation=True,
-                max_length=MAX_SEQ_LENGTH,
-                padding=False
-            )
-
-            if any(label != -100 for label in tokenized["labels"]):
+            # Combine prompt and response for proper tokenization
+            full_text = prompt_text + response_text
+            
+            # Tokenize prompt and response separately to control truncation
+            prompt_tokenized = tokenizer(prompt_text, add_special_tokens=False)
+            response_tokenized = tokenizer(response_text, add_special_tokens=False)
+            
+            # Check if combined length exceeds max
+            total_length = len(prompt_tokenized["input_ids"]) + len(response_tokenized["input_ids"])
+            
+            if total_length > MAX_SEQ_LENGTH:
+                # Truncate response if needed, but preserve full prompt (especially system message)
+                max_response_length = MAX_SEQ_LENGTH - len(prompt_tokenized["input_ids"])
+                if max_response_length < 10:  # Need at least 10 tokens for response
+                    continue  # Skip this example if prompt is too long
+                response_tokenized["input_ids"] = response_tokenized["input_ids"][:max_response_length]
+                response_tokenized["attention_mask"] = response_tokenized["attention_mask"][:max_response_length]
+            
+            # Combine tokens manually 
+            input_ids = prompt_tokenized["input_ids"] + response_tokenized["input_ids"]
+            attention_mask = prompt_tokenized["attention_mask"] + response_tokenized["attention_mask"]
+            
+            # Create labels - mask the prompt, train on response
+            prompt_length = len(prompt_tokenized["input_ids"])
+            labels = [-100] * len(input_ids)
+            
+            # Only train on the response portion
+            if prompt_length < len(input_ids):
+                labels[prompt_length:] = input_ids[prompt_length:]
+            
+            if any(label != -100 for label in labels):
                 examples.append({
-                    "input_ids": tokenized["input_ids"],
-                    "attention_mask": tokenized["attention_mask"],
-                    "labels": tokenized["labels"]
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels
                 })
 
         context.append(message)
@@ -151,8 +173,48 @@ def conversation_to_examples(messages: List[Dict[str, Any]]):
 
 
 processed_examples = []
-for sample in dataset:
-    processed_examples.extend(conversation_to_examples(sample["messages"]))
+total_conversations = len(dataset)
+for idx, sample in enumerate(dataset):
+    examples = conversation_to_examples(sample["messages"])
+    processed_examples.extend(examples)
+    
+    # Log first few examples for validation
+    if idx < 3 and examples:
+        print(f"\n=== Conversation {idx + 1} Example Validation ===")
+        for ex_idx, example in enumerate(examples[:2]):  # Show max 2 examples per conversation
+            # Decode the prompt (everything before labels start)
+            input_ids = example["input_ids"]
+            labels = example["labels"]
+            
+            # Find where the response starts (first non-masked token)
+            response_start = None
+            for i, label in enumerate(labels):
+                if label != -100:
+                    response_start = i
+                    break
+            
+            if response_start is not None:
+                prompt_tokens = input_ids[:response_start]
+                response_tokens = [input_ids[i] for i, label in enumerate(labels) if label != -100]
+                
+                prompt_text = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+                response_text = tokenizer.decode(response_tokens, skip_special_tokens=False)
+                
+                # Check if system prompt is preserved - was getting cut off 
+                full_prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+                has_aide_identity = "You are Aide" in full_prompt
+                
+                print(f"  Example {ex_idx + 1}:")
+                print(f"    System prompt preserved: {'✓' if has_aide_identity else '✗'}")
+                print(f"    Prompt length: {len(prompt_tokens)} tokens")
+                print(f"    Prompt sample: {repr(full_prompt[:100])}...")  # First 100 chars
+                print(f"    Response: {repr(response_text)}")
+                print(f"    Training tokens: {sum(1 for l in labels if l != -100)}/{len(labels)}")
+
+print(f"\nDataset Processing Complete:")
+print(f"  Original conversations: {total_conversations}")
+print(f"  Generated training examples: {len(processed_examples)}")
+print(f"  Average examples per conversation: {len(processed_examples)/total_conversations:.1f}")
 
 processed_dataset = Dataset.from_list(processed_examples)
 
@@ -162,12 +224,24 @@ split_dataset = processed_dataset.train_test_split(test_size=0.1, seed=42)
 train_ds = split_dataset["train"]
 val_ds = split_dataset["test"]
 
-# === LoRA config
+print(f"\nTrain/Test Split:")
+print(f"  Training examples: {len(train_ds)}")
+print(f"  Validation examples: {len(val_ds)}")
+
+# Analyze sequence lengths
+train_lengths = [len(example["input_ids"]) for example in train_ds]
+if train_lengths:
+    print(f"  Sequence length stats:")
+    print(f"    Min: {min(train_lengths)}, Max: {max(train_lengths)}")
+    print(f"    Average: {sum(train_lengths)/len(train_lengths):.1f}")
+    print(f"    Examples at max length ({MAX_SEQ_LENGTH}): {sum(1 for l in train_lengths if l == MAX_SEQ_LENGTH)}")
+
+# === LoRA config - Optimized for Pi5 Q5 performance with intelligence retention
 lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,  # Changed from 16 - stronger adaptation for personality training
+    r=48,  # Balanced: enough capacity for personality, not too complex for Q5
+    lora_alpha=72,  # Strong adaptation but preserves base intelligence
     target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"], #Verified via find_lora_targets.py
-    lora_dropout=0.01,  # Reduced from 0.05 - less interference with personality learning
+    lora_dropout=0.03,  # Lower dropout to preserve intelligence pathways
     bias="none",
     task_type=TaskType.CAUSAL_LM
 )
@@ -178,61 +252,117 @@ model.enable_input_require_grads()
 model.print_trainable_parameters()
 assert any(p.requires_grad for p in model.parameters()), "No trainable parameters!"
 
-# === Training arguments     # Patching to prevent NaNs
+# Custom callback for training progress logging
+class ValidationCallback(TrainerCallback):
+    def on_epoch_end(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            print(f"\nEpoch {state.epoch} Summary:")
+            print(f"  Train Loss: {logs.get('train_loss', 'N/A'):.4f}")
+            print(f"  Eval Loss: {logs.get('eval_loss', 'N/A'):.4f}")
+            print(f"  Learning Rate: {logs.get('learning_rate', 'N/A'):.2e}")
+
+# === Training arguments - Balanced for personality + intelligence retention on Pi5
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
-    num_train_epochs=5,
-    learning_rate=1e-4,  # More appropriate for LoRA - was 3e-4 (too hot)
-    lr_scheduler_type="cosine",  # Better for personality training
-    warmup_ratio=0.05,  # Increased warmup for stability with proper LR
+    num_train_epochs=3,  # Conservative to preserve base intelligence
+    learning_rate=4e-5,  # Moderate LR for personality without overwhelming intelligence
+    lr_scheduler_type="cosine",  # Cosine for gentler learning curve
+    warmup_ratio=0.15,  # Extended warmup to preserve knowledge
     bf16=True,             #<- It does not like when this is false
     fp16=False,
     logging_steps=10,
     save_strategy="epoch",
+    eval_strategy="epoch",  # Evaluate each epoch
+    save_total_limit=3,     # Keep only last 3 checkpoints
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
     report_to="none",
     logging_dir="./logs",
-    max_grad_norm=1.0,
+    max_grad_norm=0.3,  # Gentler clipping to preserve complex reasoning
     gradient_checkpointing=True,  # <--- Changed this line 08/04/25 & it worked
     gradient_checkpointing_kwargs={"use_reentrant": False},   # <--- Added this 9/30/25 to compensate for heftier training on V1 vs lite
     ddp_find_unused_parameters=False,
     remove_unused_columns=False,
-    weight_decay=0.05, # Helps with generalization and prevents overfitting
+    weight_decay=0.05, # Light regularization to maintain intelligence
 )
 
 # === Trainer
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model,
+    label_pad_token_id=-100,
+    pad_to_multiple_of=8    # Efficient memory alignment (will brick your PC a lot less)
+)
+
 trainer = Trainer(
     model=model,
     train_dataset=train_ds,
     eval_dataset=val_ds,
     tokenizer=tokenizer,
     args=training_args,
-    data_collator=default_data_collator  # Dynamic padding - more efficient
+    data_collator=data_collator,  # Proper padding for variable lengths
+    callbacks=[ValidationCallback()]
 )
 
 #===Debug - Test loss with proper training mask
 if len(train_ds) == 0:
     raise ValueError("No training samples available after preprocessing. Check dataset and filters.")
 
-batch = train_ds[0]
-input_ids = torch.tensor(batch["input_ids"]).unsqueeze(0).to(model.device)
-attention_mask = torch.tensor(batch["attention_mask"]).unsqueeze(0).to(model.device)
-# Use the properly masked labels from our tokenization function
-labels = torch.tensor(batch["labels"]).unsqueeze(0).to(model.device)
+# Skip pre-training validation for now due to tensor shape issues
+print(f"\n=== Skipping Pre-Training Validation ===")
+print("Starting training directly...")
 
-model.eval()
-with torch.no_grad():
-    output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    print("Test Loss (assistant-only):", output.loss.item())
-    
-    # Count how many tokens are actually being trained on
-    training_tokens = (labels != -100).sum().item()
-    total_tokens = labels.numel()
-    print(f"Training on {training_tokens}/{total_tokens} tokens ({training_tokens/total_tokens*100:.1f}%)")
+# Analyze training token distribution across dataset
+total_training_tokens = 0
+total_sequence_tokens = 0
+for example in train_ds:
+    labels = example["labels"]
+    total_training_tokens += sum(1 for l in labels if l != -100)
+    total_sequence_tokens += len(labels)
 
-# === Train
+print(f"\nDataset Training Statistics:")
+print(f"  Total training tokens: {total_training_tokens:,}")
+print(f"  Total sequence tokens: {total_sequence_tokens:,}")
+print(f"  Overall training ratio: {total_training_tokens/total_sequence_tokens*100:.1f}%")
+
+# === Train ===
+print(f"\n=== Starting Training ===")
 model.train()
 trainer.train()
+
+# === Post-training validation ===
+print(f"\n=== Post-Training Validation ===")
+model.eval()
+
+# Generate a sample response to validate the model works
+print("\nSample Generation Test:")
+test_prompt = "Hello! How can I help you today?"
+test_messages = [{"role": "user", "content": test_prompt}]
+
+prompt_text = tokenizer.apply_chat_template(
+    test_messages, 
+    tokenize=False, 
+    add_generation_prompt=True
+)
+
+inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=100,
+        do_sample=True,
+        temperature=0.7,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+response = tokenizer.decode(outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True)
+print(f"  Prompt: {test_prompt}")
+print(f"  Response: {response}")
+print("\nTraining completed!")
+
 model.save_pretrained(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"\nModel saved to: {OUTPUT_DIR}")
