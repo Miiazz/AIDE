@@ -6,14 +6,16 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import default_data_collator
 
+# Note: Lines 17 & 398 require user changes for path and system prompt specification. 
+
 #=== To improve Efficency (hopefully) - 09/30/25
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 # === Config ===
 MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"  # Dynamic pull from HF
-DATASET_PATH = "<Your Dataset Path>"           # Input your JSONL dataset here
-OUTPUT_DIR = "./lora_output"
+DATASET_PATH = "<Path to your JSONL dataset>"           # Input your JSONL dataset here
+OUTPUT_DIR = "lora_output"
 MAX_SEQ_LENGTH = 3072  # Increased from 2048 to preserve more personality context
 
 torch.manual_seed(42)
@@ -23,35 +25,36 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
+
+# Phi-3 specific: Use proper chat end token
+END_TOKEN_ID = tokenizer.convert_tokens_to_ids("<|end|>")
+# Check for optimal attention implementation
+attn_impl = "flash_attention_2" if os.environ.get("FLASH2","0")=="1" else "sdpa"
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map=None,  # Keep all on single GPU for LoRA training
     trust_remote_code=True,
-    attn_implementation="eager"
+    attn_implementation=attn_impl
 )
 model.config.return_dict = True
 model.config.use_cache = False
 
-# === Load dataset with error handling & robust JSONL parsing
+# === Load dataset with error handling & strict JSONL parsing
 def load_jsonl_robust(file_path):
-    """Load JSONL with line-by-line error handling for malformed JSON"""
+    """Load JSONL with strict line-by-line parsing"""
     samples = []
     with open(file_path, 'r', encoding='utf-8') as f:
-        current_json = ""
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            
-            current_json += line
             try:
-                # Try to parse as complete JSON
-                sample = json.loads(current_json)
+                sample = json.loads(line)
                 samples.append(sample)
-                current_json = ""
-            except json.JSONDecodeError:
-                # Continue building the JSON object
+            except json.JSONDecodeError as e:
+                print(f"Warning: Skipping malformed JSON on line {line_num}: {e}")
                 continue
     
     print(f"Loaded {len(samples)} samples from {file_path}")
@@ -69,10 +72,11 @@ print(f"Total samples loaded: {len(all_samples)}")
 # Convert to dataset
 dataset = Dataset.from_list(all_samples)
 
-def ensure_eos(text: str) -> str:
-    if text.endswith(tokenizer.eos_token):
+def ensure_end(text: str) -> str:
+    """Ensure text ends with Phi-3 chat end token"""
+    if text.endswith("<|end|>"):
         return text
-    return text + tokenizer.eos_token
+    return text + "<|end|>"
 
 
 def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[Dict[str, Any]]:
@@ -105,7 +109,7 @@ def trim_prompt_messages(messages: List[Dict[str, Any]], response: str) -> List[
 
         if drop_idx is None:
             # Only system messages remain; NEVER drop system messages
-            # If they don't fit even with system only, break the loop
+            # If we can't fit even with system only, break the loop
             break
         else:
             trimmed = trimmed[drop_idx + 1 :]
@@ -127,7 +131,7 @@ def conversation_to_examples(messages: List[Dict[str, Any]]):
                 add_generation_prompt=True
             )
 
-            response_text = ensure_eos(message.get("content", ""))
+            response_text = ensure_end(message.get("content", ""))
 
             # Combine prompt and response for proper tokenization
             full_text = prompt_text + response_text
@@ -171,6 +175,47 @@ def conversation_to_examples(messages: List[Dict[str, Any]]):
     return examples
 
 
+# Simple packer to reduce token waste
+def pack_examples(examples, max_len=MAX_SEQ_LENGTH, pad_id=tokenizer.pad_token_id):
+    """Pack multiple examples together to reduce padding waste"""
+    packed = []
+    cur = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    def flush():
+        if cur["input_ids"]:
+            packed.append({k: v[:] for k, v in cur.items()})
+            cur["input_ids"].clear()
+            cur["attention_mask"].clear()
+            cur["labels"].clear()
+
+    for ex in examples:
+        need = len(ex["input_ids"])
+        have = len(cur["input_ids"])
+        if have and have + need > max_len:
+            flush()
+        if need > max_len:
+            continue  # Skip overly long examples
+        
+        # Append to current packed example
+        cur["input_ids"].extend(ex["input_ids"])
+        cur["attention_mask"].extend(ex["attention_mask"])
+        cur["labels"].extend(ex["labels"])
+
+    flush()
+    
+    # Pad to multiple of 8 for tensor core efficiency
+    def pad_to_mul8(arr, pad_val):
+        rem = (-len(arr)) % 8
+        return arr + [pad_val] * rem if rem else arr
+
+    for p in packed:
+        p["input_ids"] = pad_to_mul8(p["input_ids"], pad_id)
+        p["attention_mask"] = pad_to_mul8(p["attention_mask"], 0)
+        p["labels"] = pad_to_mul8(p["labels"], -100)
+
+    return packed
+
+# Process all conversations into training examples
 processed_examples = []
 total_conversations = len(dataset)
 for idx, sample in enumerate(dataset):
@@ -215,6 +260,12 @@ print(f"  Original conversations: {total_conversations}")
 print(f"  Generated training examples: {len(processed_examples)}")
 print(f"  Average examples per conversation: {len(processed_examples)/total_conversations:.1f}")
 
+# Pack examples to reduce token waste
+print(f"\n=== Packing Examples ===")
+print(f"  Before packing: {len(processed_examples)} examples")
+processed_examples = pack_examples(processed_examples, MAX_SEQ_LENGTH)
+print(f"  After packing: {len(processed_examples)} examples")
+
 processed_dataset = Dataset.from_list(processed_examples)
 
 # Create Train / Test split
@@ -235,7 +286,7 @@ if train_lengths:
     print(f"    Average: {sum(train_lengths)/len(train_lengths):.1f}")
     print(f"    Examples at max length ({MAX_SEQ_LENGTH}): {sum(1 for l in train_lengths if l == MAX_SEQ_LENGTH)}")
 
-# === LoRA config - Optimized for Pi5 Q5 performance with intelligence retention (hopefully)
+# === LoRA config - Optimized for Pi5 Q5 performance with intelligence retention
 lora_config = LoraConfig(
     r=48,  # Balanced: enough capacity for personality, not too complex for Q5
     lora_alpha=72,  # Strong adaptation but preserves base intelligence
@@ -246,7 +297,7 @@ lora_config = LoraConfig(
 )
 
 model = get_peft_model(model, lora_config)
-model.gradient_checkpointing_enable()             # redundant but explicit
+# Remove redundant gradient checkpointing (handled by TrainingArguments)
 model.enable_input_require_grads()
 model.print_trainable_parameters()
 assert any(p.requires_grad for p in model.parameters()), "No trainable parameters!"
@@ -260,7 +311,10 @@ class ValidationCallback(TrainerCallback):
             print(f"  Eval Loss: {logs.get('eval_loss', 'N/A'):.4f}")
             print(f"  Learning Rate: {logs.get('learning_rate', 'N/A'):.2e}")
 
-# === Training arguments - Balanced for personality + intelligence retention on Pi5
+# Check BF16 support
+bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+# === Training arguments - Enhanced for personality retention
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=1,
@@ -269,8 +323,8 @@ training_args = TrainingArguments(
     learning_rate=6e-5,  # Increased for stronger identity override
     lr_scheduler_type="cosine",  # Cosine for gentler learning curve
     warmup_ratio=0.05,  # Reduced warmup for faster identity learning
-    bf16=True,             #<- It does not like when this is false
-    fp16=False,
+    bf16=bf16_supported,
+    fp16=not bf16_supported,
     logging_steps=10,
     save_strategy="epoch",
     eval_strategy="steps",  # More frequent evaluation for better checkpoint selection
@@ -281,11 +335,14 @@ training_args = TrainingArguments(
     report_to="none",
     logging_dir="./logs",
     max_grad_norm=0.3,  # Gentler clipping to preserve complex reasoning
-    gradient_checkpointing=True,  # <--- Changed this line 08/04/25 & it worked
-    gradient_checkpointing_kwargs={"use_reentrant": False},   # <--- Added this 9/30/25 to compensate for heftier training on V1 vs lite
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     ddp_find_unused_parameters=False,
     remove_unused_columns=False,
-    weight_decay=0.01, # Reduced to avoid washing out LoRA personality signal
+    weight_decay=0.0,  # No weight decay for stronger LoRA personality signal
+    group_by_length=True,  # Group similar lengths for efficiency
+    dataloader_num_workers=2,  # Parallel data loading
+    seed=42,  # Reproducibility
 )
 
 # === Trainer
@@ -358,14 +415,24 @@ with torch.no_grad():
         max_new_tokens=100,
         do_sample=True,
         temperature=0.7,
-        pad_token_id=tokenizer.eos_token_id
+        eos_token_id=END_TOKEN_ID,
+        pad_token_id=END_TOKEN_ID
     )
 
 response = tokenizer.decode(outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True)
 print(f"  Prompt: {test_prompt}")
 print(f"  Response: {response}")
 print("\nTraining completed!")
+print("Training completed successfully. Please see notes below.")
 
 model.save_pretrained(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 print(f"\nModel saved to: {OUTPUT_DIR}")
+
+# Important note about merging for GGUF conversion
+print(f"\n=== Important for GGUF Conversion ===")
+print(f"To convert to GGUF, you must MERGE the LoRA first:")
+print(f"1. Use merge_lora_and_save.py to create merged model")
+print(f"2. Then convert the merged model to GGUF")
+print(f"3. Quantize the GGUF via llama-quantize if desired.")
+print(f"4. Test model with llama-cli.")
