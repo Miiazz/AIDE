@@ -23,7 +23,7 @@ The project explores what is required to build a private, personality-driven ass
 
 ## Current Status
 
-The LoRA fine-tuning pipeline for local language models has been tested successfully, particularly when paired with strong system prompting and elevated inference temperatures.
+This repository currently focuses on personality fine-tuning workflows and the supporting foundation for a future modular runtime. Full assistant features such as memory tiers, GUI, STT, and TTS are planned but not yet complete.
 
 Early testing suggests that some model families respond better to personality adaptation than others, so AIDE is moving toward a more **model-agnostic architecture** rather than remaining tied to the Phi family alone. As futher testing is done a model recomendation(s) will be provided 
 
